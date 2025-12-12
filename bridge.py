@@ -7,221 +7,269 @@ import threading
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 import argparse
-import uuid
 import requests
+import os
+import uuid
+import configparser
 
-# CONFIGURATION
-class Config:
-    # Database configuration (change to real path later)
-    DB_PATH = "mock.db"
-    
-    # Sync intervals (in seconds)
-    SYNC_USERS_INTERVAL = 300
-    SYNC_LOGS_INTERVAL = 86400
-    
-    # Sync settings
-    MAX_RECORDS_PER_SYNC = 100
-
-# DATA MODELS
-@dataclass
-class User:
-    id: int
-    name: str
-    role: str
-    photoPath: str
-    cardNumber: Optional[str] = None
-    registrationDate: str = None
-
-@dataclass
-class FaceTemplate:
-    userId: int
-    userName: str
-    faceTemplate: str
-    photoData: str
-    enrollmentDate: str
-    syncedToDevices: List[str] = None
-    
-    def __post_init__(self):
-        if self.syncedToDevices is None:
-            self.syncedToDevices = []
-
-@dataclass
-class AccessLog:
-    id: int
-    userId: Optional[int]
-    accessMethod: str
-    result: str
-    timestamp: str
-    deviceId: str
-
-# DATABASE MANAGER
 class DatabaseManager:
-    def __init__(self, dbPath: str = Config.DB_PATH):
-        self.dbPath = dbPath
+    def __init__(self, nobleConfig: Dict, cmsConfig: Dict):
+        self.nobleConfig = nobleConfig
+        self.cmsConfig = cmsConfig
         self.initDatabase()
     
+    def get_noble_connection(self):
+        # Connection for Hardware/Logs DB (Noble)
+        dbType = self.nobleConfig['type']
+        if dbType == "mysql":
+            try:
+                import mysql.connector
+                return mysql.connector.connect(**self.nobleConfig['config'])
+            except ImportError:
+                print("Error: mysql-connector-python is required for MySQL but not installed.")
+                raise
+            except Exception as e:
+                print(f"Error connecting to Noble MySQL: {e}")
+                raise
+        else:
+            return sqlite3.connect(self.nobleConfig['path'])
+
+    def get_cms_connection(self):
+        # Connection for Users/Business DB (CMS)
+        dbType = self.cmsConfig['type']
+        if dbType == "mysql":
+            try:
+                import mysql.connector
+                return mysql.connector.connect(**self.cmsConfig['config'])
+            except ImportError:
+                print("Error: mysql-connector-python is required for MySQL but not installed.")
+                raise
+            except Exception as e:
+                print(f"Error connecting to CMS MySQL: {e}")
+                raise
+        else:
+            return sqlite3.connect(self.cmsConfig['path'])
+
+    def _get_cursor(self, conn, dbType):
+        if dbType == "mysql":
+             return conn.cursor(dictionary=True)
+        else:
+            # Note: Some methods in original code set row_factory manually
+            return conn.cursor()
+
     def initDatabase(self):
-        # Initialize the SQLite database with required tables
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
-        
-        # Student table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS student_uat (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                matrix_no TEXT NOT NULL,
-                registration_date TEXT NOT NULL
-            )
-        ''')
+        # Initialize Noble Database (Hardware/Logs)
+        connNoble = self.get_noble_connection()
+        try:
+            cursorNoble = self._get_cursor(connNoble, self.nobleConfig['type'])
+            
+            # Access logs table (accesslogs)
+            cursorNoble.execute('''
+                CREATE TABLE IF NOT EXISTS accesslogs (
+                    id VARCHAR(48) NOT NULL PRIMARY KEY,
+                    cardid VARCHAR(16) NOT NULL DEFAULT '',
+                    datetime DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
+                    terminalid VARCHAR(8) NOT NULL DEFAULT '',
+                    terminalip VARCHAR(24) DEFAULT NULL,
+                    doorid VARCHAR(8) NOT NULL DEFAULT '',
+                    termdoor VARCHAR(24) DEFAULT NULL,
+                    in_out INTEGER NOT NULL DEFAULT 0,
+                    verifysource INTEGER NOT NULL DEFAULT 0,
+                    funckey INTEGER NOT NULL DEFAULT 0,
+                    verifystatus INTEGER NOT NULL DEFAULT 0,
+                    eventcode VARCHAR(32) DEFAULT NULL,
+                    userid VARCHAR(16) DEFAULT NULL
+                )
+            ''')
 
-        # Employee table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS new_employee_uat (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                empid TEXT NOT NULL,
-                joining_date TEXT NOT NULL
-            )
-        ''')
-        
-        # Pic tables should exist in real scenario
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS student_pic_2002 (
-                id bigint(11) NOT NULL default '0',
-                matrix_no varchar(20) NOT NULL default '',
-                pic_name varchar(50) default NULL,
-                mime_type varchar(150) default NULL,
-                mime_name varchar(30) default NULL,
-                pic_contents longblob
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS new_employee_pic_2004 (
-                id bigint(11) NOT NULL default '0',
-                empid varchar(20) NOT NULL default '',
-                pic_name varchar(50) default NULL,
-                mime_type varchar(150) default NULL,
-                mime_name varchar(30) default NULL,
-                pic_contents longblob
-            )
-        ''')
+            # Terminals table (terminalsa)
+            cursorNoble.execute('''
+                CREATE TABLE IF NOT EXISTS terminalsa (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    terminalname VARCHAR(255) NOT NULL DEFAULT '',
+                    terminalid VARCHAR(8) NOT NULL DEFAULT '',
+                    ip VARCHAR(16) NOT NULL DEFAULT '',
+                    portno VARCHAR(8) NOT NULL DEFAULT '2000',
+                    active CHAR(1) NOT NULL DEFAULT '1',
+                    proctime DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
+                    model VARCHAR(16) NOT NULL DEFAULT 'E1080',
+                    fwver VARCHAR(32) NOT NULL DEFAULT '0.00',
+                    macaddr VARCHAR(24) NOT NULL DEFAULT '',
+                    doorno VARCHAR(24) NOT NULL DEFAULT '',
+                    doorstatus INTEGER DEFAULT 0,
+                    doorstatussince DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
+                    users INTEGER NOT NULL DEFAULT 0,
+                    logcount INTEGER NOT NULL DEFAULT 0,
+                    netstatus CHAR(1) NOT NULL DEFAULT 0,
+                    owner VARCHAR(50) DEFAULT NULL,
+                    logtotal INTEGER DEFAULT NULL,
+                    relaystatus INTEGER DEFAULT -1,
+                    username VARCHAR(50) DEFAULT 'admin',
+                    password VARCHAR(50) DEFAULT 'password'
+                )
+            ''')
+            
+            # Sync log table
+            cursorNoble.execute('''
+                CREATE TABLE IF NOT EXISTS syncLogs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    syncType TEXT NOT NULL,
+                    deviceName TEXT,
+                    recordsSynced INTEGER,
+                    status TEXT NOT NULL,
+                    errorMessage TEXT,
+                    timestamp TEXT NOT NULL
+                )
+            ''')
+            connNoble.commit()
+        finally:
+            connNoble.close()
 
-        # Face templates table - tracking synced status
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS faceTemplates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                userId INTEGER NOT NULL,
-                userType TEXT NOT NULL, 
-                tableYear TEXT NOT NULL,
-                syncedDevices TEXT DEFAULT '[]'
-            )
-        ''')
-        
-        # Access logs table (accesslogs_uat)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS accesslogs_uat (
-                id VARCHAR(48) NOT NULL PRIMARY KEY,
-                cardid VARCHAR(16) NOT NULL DEFAULT '',
-                datetime DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
-                terminalid VARCHAR(8) NOT NULL DEFAULT '',
-                terminalip VARCHAR(24) DEFAULT NULL,
-                doorid VARCHAR(8) NOT NULL DEFAULT '',
-                termdoor VARCHAR(24) DEFAULT NULL,
-                in_out INTEGER NOT NULL DEFAULT 0,
-                verifysource INTEGER NOT NULL DEFAULT 0,
-                funckey INTEGER NOT NULL DEFAULT 0,
-                verifystatus INTEGER NOT NULL DEFAULT 0,
-                eventcode VARCHAR(32) DEFAULT NULL,
-                userid VARCHAR(16) DEFAULT NULL
-            )
-        ''')
+        # Initialize CMS Database (Users/Business)
+        connCMS = self.get_cms_connection()
+        try:
+            cursorCMS = self._get_cursor(connCMS, self.cmsConfig['type'])
+            
+            # Student table
+            cursorCMS.execute('''
+                CREATE TABLE IF NOT EXISTS student (
+                    matrix_no VARCHAR(20) NOT NULL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    registration_date TEXT NOT NULL
+                )
+            ''')
 
-        # Terminals table (terminalsa_uat)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS terminalsa_uat (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                terminalname VARCHAR(255) NOT NULL DEFAULT '',
-                terminalid VARCHAR(8) NOT NULL DEFAULT '',
-                ip VARCHAR(16) NOT NULL DEFAULT '',
-                portno VARCHAR(8) NOT NULL DEFAULT '2000',
-                active CHAR(1) NOT NULL DEFAULT '1',
-                proctime DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
-                model VARCHAR(16) NOT NULL DEFAULT 'E1080',
-                fwver VARCHAR(32) NOT NULL DEFAULT '0.00',
-                macaddr VARCHAR(24) NOT NULL DEFAULT '',
-                doorno VARCHAR(24) NOT NULL DEFAULT '',
-                doorstatus INTEGER DEFAULT 0,
-                doorstatussince DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
-                users INTEGER NOT NULL DEFAULT 0,
-                logcount INTEGER NOT NULL DEFAULT 0,
-                netstatus CHAR(1) NOT NULL DEFAULT 0,
-                owner VARCHAR(50) DEFAULT NULL,
-                logtotal INTEGER DEFAULT NULL,
-                relaystatus INTEGER DEFAULT -1,
-                username VARCHAR(50) DEFAULT 'admin',
-                password VARCHAR(50) DEFAULT 'password'
-            )
-        ''')
-        
-        # Sync log table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS syncLogs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                syncType TEXT NOT NULL,
-                deviceName TEXT,
-                recordsSynced INTEGER,
-                status TEXT NOT NULL,
-                errorMessage TEXT,
-                timestamp TEXT NOT NULL
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
+            # Employee table
+            cursorCMS.execute('''
+                CREATE TABLE IF NOT EXISTS new_employee (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    empid TEXT NOT NULL,
+                    app_date TEXT NOT NULL
+                )
+            ''')
+            
+            # Pic tables should exist in real scenario
+            # Note: MySQL uses BLOB or LONGBLOB. SQLite is flexible.
+            cursorCMS.execute('''
+                CREATE TABLE IF NOT EXISTS student_pic_2002 (
+                    id bigint(11) NOT NULL default '0',
+                    matrix_no varchar(20) NOT NULL default '',
+                    pic_name varchar(50) default NULL,
+                    mime_type varchar(150) default NULL,
+                    mime_name varchar(30) default NULL,
+                    pic_contents longblob
+                )
+            ''')
+            
+            cursorCMS.execute('''
+                CREATE TABLE IF NOT EXISTS new_employee_pic_2004 (
+                    id bigint(11) NOT NULL default '0',
+                    empid varchar(20) NOT NULL default '',
+                    pic_name varchar(50) default NULL,
+                    mime_type varchar(150) default NULL,
+                    mime_name varchar(30) default NULL,
+                    pic_contents longblob
+                )
+            ''')
+
+            # Face templates table - tracking synced status
+            cursorCMS.execute('''
+                CREATE TABLE IF NOT EXISTS faceTemplates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    userId TEXT NOT NULL,
+                    userType TEXT NOT NULL, 
+                    tableYear TEXT NOT NULL,
+                    syncedDevices TEXT DEFAULT '[]'
+                )
+            ''')
+            connCMS.commit()
+        finally:
+            connCMS.close()
     
-    def getUnsyncedUsers(self) -> List[Dict]:
+    def getUnsyncedUsers(self, startTime: Optional[int] = None, endTime: Optional[int] = None) -> List[Dict]:
         # Get users from both student_uat and new_employee_uat
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
+        conn = self.get_cms_connection()
+        cursor = self._get_cursor(conn, self.cmsConfig['type'])
         
         users = []
         
         # 1. Fetch Students
         try:
-            cursor.execute('''
-                SELECT id, name, matrix_no, registration_date
-                FROM student_uat
-            ''')
+            # Need to handle date filtering if passed
+            query = 'SELECT matrix_no, name, registration_date FROM student'
+            params = []
+            
+            # Basic date filtering logic (simplified since format might vary in real DB)
+            # Assuming registration_date is stored as YYYY-MM-DD string
+            if startTime and endTime:
+                 start_dt = datetime.datetime.fromtimestamp(startTime).strftime('%Y-%m-%d')
+                 end_dt = datetime.datetime.fromtimestamp(endTime).strftime('%Y-%m-%d')
+                 query += ' WHERE registration_date BETWEEN ? AND ?'
+                 params = [start_dt, end_dt]
+            elif startTime:
+                 start_dt = datetime.datetime.fromtimestamp(startTime).strftime('%Y-%m-%d')
+                 query += ' WHERE registration_date >= ?'
+                 params = [start_dt]
+                 
+            cursor.execute(query, params)
             for row in cursor.fetchall():
-                users.append({
-                    "id": row[0],
-                    "name": row[1],
-                    "role": "student",
-                    "photoPath": "", # Dynamically determined later
-                    "cardNumber": row[2], # matrix_no
-                    "registrationDate": row[3]
-                })
-        except sqlite3.OperationalError:
-            pass # Table might not exist yet
+                # Handle SQLite tuple vs MySQL dict cursor (if we switch later)
+                # For now assume tuple if SQLite, but let's be robust
+                if isinstance(row, dict):
+                     users.append({
+                        "id": row['matrix_no'],
+                        "name": row['name'],
+                        "role": "student",
+                        "photoPath": "",
+                        "cardNumber": row['matrix_no'],
+                        "registrationDate": row['registration_date']
+                    })
+                else:
+                    users.append({
+                        "id": row[0], # matrix_no
+                        "name": row[1],
+                        "role": "student",
+                        "photoPath": "", # Dynamically determined later
+                        "cardNumber": row[0],
+                        "registrationDate": row[2]
+                    })
+        except Exception as e:
+            # Table might not exist yet or other error
+            # print(f"Error fetching students: {e}")
+            pass
             
         # 2. Fetch Employees
         try:
-            cursor.execute('''
-                SELECT id, name, empid, joining_date
-                FROM new_employee_uat
-            ''')
+            query = 'SELECT id, name, empid, app_date FROM new_employee'
+            params = []
+            if startTime and endTime:
+                 start_dt = datetime.datetime.fromtimestamp(startTime).strftime('%Y-%m-%d')
+                 end_dt = datetime.datetime.fromtimestamp(endTime).strftime('%Y-%m-%d')
+                 query += ' WHERE app_date BETWEEN ? AND ?'
+                 params = [start_dt, end_dt]
+                 
+            cursor.execute(query, params)
             for row in cursor.fetchall():
-                users.append({
-                    "id": row[0],
-                    "name": row[1],
-                    "role": "employee",
-                    "photoPath": "",
-                    "cardNumber": row[2], # empid
-                    "registrationDate": row[3] # joining_date
-                })
-        except sqlite3.OperationalError:
+                if isinstance(row, dict):
+                    users.append({
+                        "id": row['id'],
+                        "name": row['name'],
+                        "role": "employee",
+                        "photoPath": "",
+                        "cardNumber": row['empid'],
+                        "registrationDate": row['app_date']
+                    })
+                else:
+                    users.append({
+                        "id": row[0],
+                        "name": row[1],
+                        "role": "employee",
+                        "photoPath": "",
+                        "cardNumber": row[2], # empid
+                        "registrationDate": row[3] # app_date
+                    })
+        except Exception:
             pass
         
         conn.close()
@@ -229,14 +277,15 @@ class DatabaseManager:
     
     def getUnsyncedFaceTemplates(self) -> List[Dict]:
         # Get face templates for all users by querying the appropriate year-based tables
-        conn = sqlite3.connect(self.dbPath)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        conn = self.get_cms_connection()
+        if self.cmsConfig['type'] == "sqlite":
+            conn.row_factory = sqlite3.Row
+        
+        cursor = self._get_cursor(conn, self.cmsConfig['type'])
         
         templates = []
         
         # Get all users first to know where to look
-        # (In a highly scaled system, we would not load all into memory, but for bridge sync it's okay)
         all_users = self.getUnsyncedUsers()
         
         for user in all_users:
@@ -267,8 +316,14 @@ class DatabaseManager:
                 cursor.execute(query, (user["cardNumber"],))
                 row = cursor.fetchone()
                 if row:
-                    photo_data = row['pic_contents']
-            except sqlite3.OperationalError:
+                    # Handle sqlite3.Row or tuple or dict
+                    if isinstance(row, dict):
+                        photo_data = row['pic_contents']
+                    elif isinstance(row, sqlite3.Row):
+                         photo_data = row['pic_contents']
+                    else:
+                        photo_data = row[0]
+            except Exception:
                 # Table for that year might not exist
                 continue
                 
@@ -278,7 +333,7 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT id, syncedDevices FROM faceTemplates 
                     WHERE userId = ? AND userType = ?
-                ''', (user["id"], user_role))
+                ''', (str(user["id"]), user_role))
                 
                 status_row = cursor.fetchone()
                 
@@ -286,22 +341,22 @@ class DatabaseManager:
                 template_id = None
                 
                 if status_row:
-                    template_id = status_row['id']
-                    synced_devices = json.loads(status_row['syncedDevices']) if status_row['syncedDevices'] else []
+                    if isinstance(status_row, dict) or isinstance(status_row, sqlite3.Row):
+                        template_id = status_row['id']
+                        synced_devices = json.loads(status_row['syncedDevices']) if status_row['syncedDevices'] else []
+                    else:
+                        template_id = status_row[0]
+                        synced_devices = json.loads(status_row[1]) if status_row[1] else []
                 else:
                     # Insert new tracking record
                     cursor.execute('''
                         INSERT INTO faceTemplates (userId, userType, tableYear, syncedDevices)
                         VALUES (?, ?, ?, ?)
-                    ''', (user["id"], user_role, year, '[]'))
+                    ''', (str(user["id"]), user_role, year, '[]'))
                     template_id = cursor.lastrowid
                     conn.commit()
                 
-                # Convert blob to base64 string for the device client if needed, 
-                # or pass raw bytes if the client handles it. 
-                # Original code used strings for photoData. We'll assume base64 encoding needed or handled.
-                # For simplicity here, let's assume the blob is what we want.
-                # But JSON serialization might fail if it's raw bytes.
+                # Convert blob to base64 string
                 import base64
                 if isinstance(photo_data, bytes):
                     photo_data_str = base64.b64encode(photo_data).decode('utf-8')
@@ -322,33 +377,47 @@ class DatabaseManager:
         return templates
 
     def getDevices(self) -> List[Dict]:
-        # Get active devices from terminalsa_uat
-        conn = sqlite3.connect(self.dbPath)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        # Get active devices from terminalsa
+        conn = self.get_noble_connection()
+        if self.nobleConfig['type'] == "sqlite":
+            conn.row_factory = sqlite3.Row
+        cursor = self._get_cursor(conn, self.nobleConfig['type'])
         
         cursor.execute('''
-            SELECT * FROM terminalsa_uat WHERE active = '1'
+            SELECT * FROM terminalsa WHERE active = '1'
         ''')
         
         devices = []
         for row in cursor.fetchall():
-            devices.append(dict(row))
+            if isinstance(row, sqlite3.Row):
+                devices.append(dict(row))
+            elif isinstance(row, dict):
+                devices.append(row)
+            else:
+                # Fallback if no row_factory/dict cursor, manual mapping would be needed
+                # But we are setting row_factory for sqlite, and dict cursor for mysql
+                pass
             
         conn.close()
         return devices
     
     def markFaceTemplateSynced(self, templateId: int, deviceName: str):
         # Mark a face template as synced to a specific device
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
+        conn = self.get_cms_connection()
+        cursor = self._get_cursor(conn, self.cmsConfig['type'])
         
         # Get current synced devices
         cursor.execute('SELECT syncedDevices FROM faceTemplates WHERE id = ?', (templateId,))
         row = cursor.fetchone()
         
+        val = None
         if row:
-            syncedDevices = json.loads(row[0]) if row[0] else []
+            if isinstance(row, dict) or isinstance(row, sqlite3.Row):
+                val = row['syncedDevices']
+            else:
+                val = row[0]
+                
+            syncedDevices = json.loads(val) if val else []
             if deviceName not in syncedDevices:
                 syncedDevices.append(deviceName)
                 
@@ -367,8 +436,8 @@ class DatabaseManager:
         if not logs:
             return 0
         
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
+        conn = self.get_noble_connection()
+        cursor = self._get_cursor(conn, self.nobleConfig['type'])
         
         savedCount = 0
         for log in logs:
@@ -388,7 +457,7 @@ class DatabaseManager:
                 door_id = str(log.get('Door', ''))
                 term_door = f"{terminal_id}:{door_id}"
                 
-                # Map Type (Entry/Exit) to in_out (1/2) - Assumption
+                # Map Type (Entry/Exit)
                 log_type = log.get('Type', '')
                 in_out = 1 if log_type == 'Entry' else 2 if log_type == 'Exit' else 0
                 
@@ -398,7 +467,7 @@ class DatabaseManager:
 
                 # Check for duplicates based on terminalid and datetime
                 cursor.execute('''
-                    SELECT id FROM accesslogs_uat 
+                    SELECT id FROM accesslogs 
                     WHERE terminalid = ? AND datetime = ? AND cardid = ?
                 ''', (terminal_id, dt_str, card_id))
                 
@@ -406,7 +475,7 @@ class DatabaseManager:
                     continue
 
                 cursor.execute('''
-                    INSERT INTO accesslogs_uat 
+                    INSERT INTO accesslogs 
                     (id, cardid, datetime, terminalid, terminalip, doorid, termdoor, 
                      in_out, verifysource, funckey, verifystatus, eventcode, userid)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -438,16 +507,37 @@ class DatabaseManager:
     
     def getLastSyncedLogTime(self, terminalId: str) -> Optional[int]:
         # Get the last datetime synced from a device and convert to timestamp
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
+        conn = self.get_noble_connection()
+        cursor = self._get_cursor(conn, self.nobleConfig['type'])
         
         cursor.execute('''
             SELECT MAX(datetime) 
-            FROM accesslogs_uat 
+            FROM accesslogs 
             WHERE terminalid = ?
         ''', (terminalId,))
         
-        result = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        result = None
+        if row:
+             if isinstance(row, dict) or isinstance(row, sqlite3.Row):
+                  pass # Handled below by trying index or values
+             else:
+                  result = row[0]
+        
+        # Let's retry with alias
+        if result is None:
+             cursor.execute('''
+                SELECT MAX(datetime) as max_dt
+                FROM accesslogs 
+                WHERE terminalid = ?
+            ''', (terminalId,))
+             row = cursor.fetchone()
+             if row:
+                if isinstance(row, dict) or isinstance(row, sqlite3.Row):
+                    result = row['max_dt']
+                else:
+                    result = row[0]
+        
         conn.close()
         
         if result and result != '0000-00-00 00:00:00':
@@ -461,8 +551,8 @@ class DatabaseManager:
     def logSyncOperation(self, syncType: str, deviceName: Optional[str], 
                         recordsSynced: int, status: str, errorMessage: Optional[str] = None):
         # Log a sync operation
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
+        conn = self.get_noble_connection()
+        cursor = self._get_cursor(conn, self.nobleConfig['type'])
         
         cursor.execute('''
             INSERT INTO syncLogs (syncType, deviceName, recordsSynced, status, errorMessage, timestamp)
@@ -479,6 +569,96 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
+# CONFIGURATION
+class Config:
+    # Load configuration
+    _config_parser = configparser.ConfigParser()
+    if os.path.exists('config.ini'):
+        _config_parser.read('config.ini')
+        if 'Database.Noble' not in _config_parser:
+             print("Warning: [Database.Noble] section missing in config.ini. Using defaults.")
+             _config_parser['Database.Noble'] = {}
+        if 'Database.CMS' not in _config_parser:
+             print("Warning: [Database.CMS] section missing in config.ini. Using defaults.")
+             _config_parser['Database.CMS'] = {}
+    else:
+        print("Warning: config.ini not found. Using defaults.")
+        _config_parser['Database.Noble'] = {}
+        _config_parser['Database.CMS'] = {}
+        _config_parser['API'] = {}
+    
+    _noble_section = _config_parser['Database.Noble']
+    _cms_section = _config_parser['Database.CMS']
+    _api_section = _config_parser['API'] if 'API' in _config_parser else {}
+
+    # Noble Database configuration (Hardware/Logs)
+    NOBLE_DB_PATH = _noble_section.get('Path', "noble_mock.db")
+    NOBLE_DB_TYPE = _noble_section.get('Type', "sqlite")
+    
+    NOBLE_DB_CONFIG = {}
+    if NOBLE_DB_TYPE == 'mysql':
+        NOBLE_DB_CONFIG = {
+            'host': _noble_section.get('Host', 'localhost'),
+            'user': _noble_section.get('User', 'root'),
+            'password': _noble_section.get('Password', ''),
+            'database': _noble_section.get('Name', 'noble_dahnua')
+        }
+
+    # CMS Database configuration (Users/Business)
+    CMS_DB_PATH = _cms_section.get('Path', "cms_mock.db")
+    CMS_DB_TYPE = _cms_section.get('Type', "sqlite")
+    
+    CMS_DB_CONFIG = {}
+    if CMS_DB_TYPE == 'mysql':
+        CMS_DB_CONFIG = {
+            'host': _cms_section.get('Host', 'localhost'),
+            'user': _cms_section.get('User', 'root'),
+            'password': _cms_section.get('Password', ''),
+            'database': _cms_section.get('Name', 'cms_ora')
+        }
+    
+    # API Configuration
+    API_URL = _api_section.get('URL', '')
+    
+    # Sync intervals (in seconds)
+    SYNC_USERS_INTERVAL = 300
+    SYNC_LOGS_INTERVAL = 86400
+    
+    # Sync settings
+    MAX_RECORDS_PER_SYNC = 100
+
+# DATA MODELS
+@dataclass
+class User:
+    id: Any
+    name: str
+    role: str
+    photoPath: str
+    cardNumber: Optional[str] = None
+    registrationDate: str = None
+
+@dataclass
+class FaceTemplate:
+    userId: Any
+    userName: str
+    faceTemplate: str
+    photoData: str
+    enrollmentDate: str
+    syncedToDevices: List[str] = None
+    
+    def __post_init__(self):
+        if self.syncedToDevices is None:
+            self.syncedToDevices = []
+
+@dataclass
+class AccessLog:
+    id: int
+    userId: Optional[Any]
+    accessMethod: str
+    result: str
+    timestamp: str
+    deviceId: str
+
 # DEVICE CLIENT
 class DeviceClient:
     # Client for interacting with devices via their APIs
@@ -491,7 +671,9 @@ class DeviceClient:
         self.username = deviceConfig.get("username", "admin")
         self.password = deviceConfig.get("password", "password")
         
-        self.baseUrl = f"http://{self.ip}:{self.port}"
+        # Use global API IP if configured, otherwise use device IP
+        target_ip = Config.API_URL if Config.API_URL else self.ip
+        self.baseUrl = f"http://{target_ip}:{self.port}"
         self.auth = (self.username, self.password)
     
     def enrollUser(self, userData: Dict) -> bool:
@@ -690,7 +872,18 @@ class SyncManager:
     # Manages synchronization between database and devices
     
     def __init__(self):
-        self.dbManager = DatabaseManager()
+        # Pass separate configs for Noble and CMS
+        nobleConfig = {
+            'type': Config.NOBLE_DB_TYPE,
+            'path': Config.NOBLE_DB_PATH,
+            'config': Config.NOBLE_DB_CONFIG
+        }
+        cmsConfig = {
+            'type': Config.CMS_DB_TYPE,
+            'path': Config.CMS_DB_PATH,
+            'config': Config.CMS_DB_CONFIG
+        }
+        self.dbManager = DatabaseManager(nobleConfig, cmsConfig)
         self.deviceClients = [] # Will be loaded dynamically
         self.running = False
     
@@ -698,7 +891,8 @@ class SyncManager:
         # Start the sync manager
         self.running = True
         print("Starting Device Bridge Sync Manager")
-        print(f"Database: {Config.DB_PATH}")
+        print(f"Noble DB: {Config.NOBLE_DB_PATH}")
+        print(f"CMS DB: {Config.CMS_DB_PATH}")
         
         # Load devices
         self.refreshDevices()
@@ -730,13 +924,13 @@ class SyncManager:
         self.running = False
         print("\nStopping sync manager...")
     
-    def syncUsersToDevices(self):
+    def syncUsersToDevices(self, startTime: Optional[int] = None, endTime: Optional[int] = None):
         # Sync users and face templates to all devices
         print(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Syncing users to devices...")
         
         try:
             # Get unsynced users and face templates
-            users = self.dbManager.getUnsyncedUsers()
+            users = self.dbManager.getUnsyncedUsers(startTime, endTime)
             faceTemplates = self.dbManager.getUnsyncedFaceTemplates()
             
             totalUsersSynced = 0
@@ -799,7 +993,7 @@ class SyncManager:
         self.refreshDevices()
         
         for deviceClient in self.deviceClients:
-            print(f"\nSyncing logs from device: {deviceClient.name}")
+            # print(f"\nSyncing logs from device: {deviceClient.name}")
             
             try:
                 # Get last synced time
@@ -827,7 +1021,8 @@ class SyncManager:
                     
                     print(f" Saved {savedCount} new logs from {deviceClient.name}")
                 else:
-                    print(f" No new logs from {deviceClient.name}")
+                    # print(f" No new logs from {deviceClient.name}")
+                    pass
                     
             except Exception as e:
                 errorMsg = str(e)
@@ -840,7 +1035,8 @@ class SyncManager:
                     errorMessage=errorMsg
                 )
         
-        print(f"\nLog sync completed: {totalLogsSaved} total logs saved")
+        if totalLogsSaved > 0:
+            print(f"\nLog sync completed: {totalLogsSaved} total logs saved")
 
 # CLI APPLICATION
 class BridgeCLI:
@@ -848,13 +1044,26 @@ class BridgeCLI:
     
     def __init__(self):
         self.syncManager = SyncManager()
-        self.dbManager = DatabaseManager()
+        # Initialize dbManager same way as SyncManager for status checks
+        nobleConfig = {
+            'type': Config.NOBLE_DB_TYPE,
+            'path': Config.NOBLE_DB_PATH,
+            'config': Config.NOBLE_DB_CONFIG
+        }
+        cmsConfig = {
+            'type': Config.CMS_DB_TYPE,
+            'path': Config.CMS_DB_PATH,
+            'config': Config.CMS_DB_CONFIG
+        }
+        self.dbManager = DatabaseManager(nobleConfig, cmsConfig)
         
     def run(self):
         # Run the CLI application
         parser = argparse.ArgumentParser(description='Device Bridge - Sync between database and devices')
         parser.add_argument('command', choices=['start', 'stop', 'status', 'sync-users', 'sync-logs', 'test'], help='Command to execute')
         parser.add_argument('--device', help='Specific device name for sync operations')
+        parser.add_argument('--starttime', help='Start time for sync operations')
+        parser.add_argument('--endtime', help='End time for sync operations')
         
         args = parser.parse_args()
         
@@ -865,7 +1074,7 @@ class BridgeCLI:
         elif args.command == 'status':
             self.show_status()
         elif args.command == 'sync-users':
-            self.manual_sync_users(args.device)
+            self.manual_sync_users(args.device, args.starttime, args.endtime)
         elif args.command == 'sync-logs':
             self.manual_sync_logs(args.device)
         elif args.command == 'test':
@@ -897,36 +1106,61 @@ class BridgeCLI:
     
     def show_status(self):
         # Show current status
-        conn = sqlite3.connect(Config.DB_PATH)
-        cursor = conn.cursor()
+        
+        # Connect to CMS DB for user stats
+        connCMS = self.dbManager.get_cms_connection()
+        cursorCMS = connCMS.cursor()
         
         # Count records
-        cursor.execute('SELECT COUNT(*) FROM users')
-        userCount = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM faceTemplates')
-        templateCount = cursor.fetchone()[0]
-        
-        # Check if accesslogs_uat exists
         try:
-            cursor.execute('SELECT COUNT(*) FROM accesslogs_uat')
-            logCount = cursor.fetchone()[0]
-        except sqlite3.OperationalError:
+            cursorCMS.execute('SELECT COUNT(*) FROM student')
+            studentCount = cursorCMS.fetchone()[0]
+        except Exception:
+            studentCount = "N/A"
+
+        try:
+            cursorCMS.execute('SELECT COUNT(*) FROM new_employee')
+            employeeCount = cursorCMS.fetchone()[0]
+        except Exception:
+            employeeCount = "N/A"
+        
+        try:
+            cursorCMS.execute('SELECT COUNT(*) FROM faceTemplates')
+            templateCount = cursorCMS.fetchone()[0]
+        except Exception:
+            templateCount = "N/A"
+            
+        connCMS.close()
+        
+        # Connect to Noble DB for system stats
+        connNoble = self.dbManager.get_noble_connection()
+        cursorNoble = connNoble.cursor()
+        
+        # Check if accesslogs exists
+        try:
+            cursorNoble.execute('SELECT COUNT(*) FROM accesslogs')
+            logCount = cursorNoble.fetchone()[0]
+        except Exception:
             logCount = "N/A (table missing)"
         
-        cursor.execute('SELECT COUNT(*) FROM syncLogs')
-        syncCount = cursor.fetchone()[0]
+        try:
+            cursorNoble.execute('SELECT COUNT(*) FROM syncLogs')
+            syncCount = cursorNoble.fetchone()[0]
+            
+            cursorNoble.execute('SELECT syncType, status, COUNT(*) FROM syncLogs GROUP BY syncType, status')
+            syncStats = cursorNoble.fetchall()
+        except Exception:
+            syncCount = "N/A"
+            syncStats = []
         
-        cursor.execute('SELECT syncType, status, COUNT(*) FROM syncLogs GROUP BY syncType, status')
-        syncStats = cursor.fetchall()
-        
-        conn.close()
+        connNoble.close()
         
         print("=" * 60)
         print("BRIDGE STATUS")
         print("=" * 60)
         print(f"Database Statistics:")
-        print(f" Users: {userCount}")
+        print(f" Students: {studentCount}")
+        print(f" Employees: {employeeCount}")
         print(f" Face Templates: {templateCount}")
         print(f" Access Logs: {logCount}")
         print(f" Sync Operations: {syncCount}")
@@ -935,7 +1169,8 @@ class BridgeCLI:
         self.syncManager.refreshDevices()
         print(f"\nConfigured Devices: {len(self.syncManager.deviceClients)}")
         for client in self.syncManager.deviceClients:
-            print(f" - {client.name} ({client.ip})")
+            # Check online status with a quick timeout (optional, for display only)
+            print(f" - {client.name} ({client.ip}) : {client.baseUrl}")
         
         print(f"\nSync Intervals:")
         print(f" Users to Devices: Every {Config.SYNC_USERS_INTERVAL} seconds")
@@ -943,10 +1178,15 @@ class BridgeCLI:
         
         if syncStats:
             print(f"\nSync Statistics:")
-            for syncType, status, count in syncStats:
-                print(f" {syncType}: {status} ({count} times)")
+            for row in syncStats:
+                # Handle tuple or dict/Row result
+                if isinstance(row, tuple):
+                    print(f" {row[0]}: {row[1]} ({row[2]} times)")
+                else: 
+                     # If using dict cursor (mysql)
+                     print(f" {row['syncType']}: {row['status']} ({row['COUNT(*)']} times)")
     
-    def manual_sync_users(self, deviceName: Optional[str] = None):
+    def manual_sync_users(self, deviceName: Optional[str] = None, startTime: Optional[int] = None, endTime: Optional[int] = None):
         # Manually sync users to devices
         print("Manually syncing users to devices...")
         
@@ -956,7 +1196,7 @@ class BridgeCLI:
             deviceClient = next((d for d in self.syncManager.deviceClients if d.name == deviceName), None)
             if deviceClient:
                 # Get users and sync
-                users = self.dbManager.getUnsyncedUsers()
+                users = self.dbManager.getUnsyncedUsers(startTime, endTime)
                 faceTemplates = self.dbManager.getUnsyncedFaceTemplates()
                 
                 for user in users:
@@ -972,7 +1212,7 @@ class BridgeCLI:
                 print(f"Device {deviceName} not found.")
         else:
             # Sync to all devices
-            self.syncManager.syncUsersToDevices()
+            self.syncManager.syncUsersToDevices(startTime, endTime)
     
     def manual_sync_logs(self, deviceName: Optional[str] = None):
         # Manually sync logs from devices
